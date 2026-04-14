@@ -1,20 +1,28 @@
 import Foundation
 import MusicTheory
 
+/// The register-placed output of `VoiceLeadingEngine`.
+///
+/// Bass and upper voices are stored separately so the app can route them to different
+/// MIDI channels, instruments, or synthesiser layers independently.
 public struct VoicedChord: Hashable, Codable, Sendable {
+    /// The source chord, including its inversion index.
     public let chord: Chord
     /// The upper chord voices, sorted ascending, placed within the context's preferred register.
     public let upperVoices: [Pitch]
     /// The bass voice, placed within the context's bass register.
     public let bassVoice: Pitch
 
-    /// All pitches sorted ascending, bass first.
+    /// All pitches sorted ascending — bass first, then upper voices.
     public var allPitches: [Pitch] { ([bassVoice] + upperVoices).sorted() }
     /// The highest upper voice.
     public var topPitch: Pitch { upperVoices[upperVoices.count - 1] }
     /// MIDI note numbers for all pitches (bass + upper voices), sorted ascending.
+    /// Pass directly to a sequencer or MIDI output.
     public var midiNotes: [Int] { allPitches.map(\.midiNoteNumber) }
 
+    /// Creates a `VoicedChord`.
+    /// - Returns: `nil` if `upperVoices` is empty.
     public init?(chord: Chord, upperVoices: [Pitch], bassVoice: Pitch) {
         guard !upperVoices.isEmpty else { return nil }
         self.chord = chord
@@ -23,7 +31,19 @@ public struct VoicedChord: Hashable, Codable, Sendable {
     }
 }
 
+/// Converts a `Chord` into a register-specific `VoicedChord`.
 public protocol VoiceLeading {
+    /// Voices a chord, optionally minimising movement from a previous voicing.
+    ///
+    /// - Parameters:
+    ///   - chord: The chord to voice.
+    ///   - previous: The preceding `VoicedChord`, used to guide smooth voice leading.
+    ///     Pass `nil` for the first chord in a sequence.
+    ///   - context: The harmonic environment supplying register constraints.
+    ///   - policy: Controls which inversion is selected.
+    ///   - role: Optional harmonic function that biases voicing decisions.
+    /// - Returns: A `VoicedChord` placed within the context's register ranges.
+    /// - Throws: `HarmonyEngineError.voicingOutOfRange` if no valid voicing exists.
     func voice(
         chord: Chord,
         previous: VoicedChord?,
@@ -34,6 +54,7 @@ public protocol VoiceLeading {
 }
 
 public extension VoiceLeading {
+    /// Convenience overload that omits `role`, equivalent to passing `role: nil`.
     func voice(
         chord: Chord,
         previous: VoicedChord?,
@@ -44,6 +65,18 @@ public extension VoiceLeading {
     }
 }
 
+/// Default implementation of `VoiceLeading`.
+///
+/// ## Algorithm
+/// For each inversion of the chord, pitches are placed across candidate octaves within the
+/// preferred register. Each valid voicing is scored by:
+/// - Total semitone movement across upper voices from the previous chord.
+/// - Top-voice leap (weighted ×1.5).
+/// - Bass distance outside the bass register (weighted ×4 per semitone).
+/// - Role-based bias (see `HarmonyRole`).
+///
+/// The lowest-scoring candidate is selected. Ties are broken by inversion index, then bass
+/// pitch, then top pitch.
 public struct VoiceLeadingEngine: VoiceLeading {
     public init() {}
 
@@ -107,8 +140,8 @@ public struct VoiceLeadingEngine: VoiceLeading {
 
     private func filteredInversions(for chord: Chord, policy: InversionPolicy) -> [Chord] {
         switch policy {
-        case .rootPosition:       return chord.inversions.filter { $0.inversion == 0 }
-        case .fixed(let inv):     return chord.inversions.filter { $0.inversion == inv }
+        case .rootPosition:        return chord.inversions.filter { $0.inversion == 0 }
+        case .fixed(let inv):      return chord.inversions.filter { $0.inversion == inv }
         case .keepClose, .nearest: return chord.inversions
         }
     }
@@ -119,6 +152,8 @@ public struct VoiceLeadingEngine: VoiceLeading {
         return minOctave...maxOctave
     }
 
+    /// Finds the pitch in the bass register whose pitch class matches `source`,
+    /// placing it closest to the register's midpoint.
     private func bestBassPitch(for source: Pitch, context: HarmonyContext) -> Pitch {
         let midiClass = ((source.midiNoteNumber % 12) + 12) % 12
         var candidates = [Pitch]()
@@ -175,14 +210,14 @@ public struct VoiceLeadingEngine: VoiceLeading {
         guard let role = role else { return 0 }
         switch role {
         case .dominant:
-            // Prefer brighter register: penalize voicings below MIDI 72 at the top voice.
+            // Prefer brighter register: penalise voicings below MIDI 72 at the top voice.
             let brightness = max(0, 72 - candidate.voicedChord.topPitch.midiNoteNumber)
             return Double(brightness) * 0.5
         case .tonic:
             // Slight preference for root position to reinforce stability.
             return candidate.inversion != 0 ? 2.0 : 0.0
         case .passing:
-            // Minimize bass movement when a previous chord exists.
+            // Minimise bass movement when a previous chord exists.
             guard let previous = previous else { return 0 }
             return Double(abs(candidate.voicedChord.bassVoice.midiNoteNumber - previous.bassVoice.midiNoteNumber)) * 2.0
         default:

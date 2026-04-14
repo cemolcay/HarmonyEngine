@@ -2,33 +2,26 @@ import Foundation
 import MusicTheory
 
 public protocol ChordBuilding {
-    func buildChord(step: ProgressionStep, context: HarmonyContext) throws -> Chord
+    func buildChord(recipe: ChordRecipe, context: HarmonyContext) throws -> Chord
 }
 
 public struct ChordBuilder: ChordBuilding {
     public init() {}
 
-    public func buildChord(step: ProgressionStep, context: HarmonyContext) throws -> Chord {
-        if let recipe = step.chordRecipe {
-            let root = try resolveRoot(recipe: recipe, context: context)
-            let chordType = try applyTensionPolicy(
-                recipe.tensionPolicy,
-                to: recipe.chordType,
-                root: root,
-                scaleDegree: recipe.scaleDegree,
-                context: context
-            )
-            return Chord(type: chordType, root: root)
-        }
-
-        guard let scaleDegree = step.scaleDegree else {
-            throw HarmonyEngineError.missingChordSource
-        }
-
-        let root = try noteName(for: scaleDegree, in: context.scale)
-        let chordType = try diatonicChordType(scaleDegree: scaleDegree, scale: context.scale, stackSize: 3)
+    public func buildChord(recipe: ChordRecipe, context: HarmonyContext) throws -> Chord {
+        let root = try resolveRoot(recipe: recipe, context: context)
+        let baseChordType = try resolveChordType(recipe: recipe, context: context)
+        let effectiveTension = effectiveTensionPolicy(recipe: recipe)
+        let chordType = try applyTensionPolicy(
+            effectiveTension,
+            to: baseChordType,
+            scaleDegree: recipe.scaleDegree,
+            context: context
+        )
         return Chord(type: chordType, root: root)
     }
+
+    // MARK: - Root resolution
 
     private func resolveRoot(recipe: ChordRecipe, context: HarmonyContext) throws -> NoteName {
         if let root = recipe.root {
@@ -47,6 +40,83 @@ public struct ChordBuilder: ChordBuilding {
         }
         return noteNames[scaleDegree - 1]
     }
+
+    // MARK: - Chord type resolution
+
+    /// Returns the explicit chord type, or infers the diatonic quality from the scale.
+    /// Inference is only supported for heptatonic (7-note) scales and requires `scaleDegree`.
+    private func resolveChordType(recipe: ChordRecipe, context: HarmonyContext) throws -> ChordType {
+        if let chordType = recipe.chordType {
+            return chordType
+        }
+        guard let scaleDegree = recipe.scaleDegree else {
+            throw HarmonyEngineError.missingChordSource
+        }
+        guard context.scale.noteNames.count == 7 else {
+            throw HarmonyEngineError.unableToResolveChord
+        }
+        return try diatonicChordType(scaleDegree: scaleDegree, scale: context.scale, stackSize: 3)
+    }
+
+    // MARK: - Tension policy
+
+    /// Resolves the effective tension policy.
+    /// - An explicit `tensionPolicy` in the recipe always wins (even `.none`).
+    /// - When `tensionPolicy` is `nil`, the role provides the default.
+    /// - If neither is set, falls back to `.none`.
+    private func effectiveTensionPolicy(recipe: ChordRecipe) -> TensionPolicy {
+        if let explicit = recipe.tensionPolicy {
+            return explicit
+        }
+        guard let role = recipe.role, recipe.scaleDegree != nil else { return .none }
+        switch role {
+        case .dominant: return .diatonicSeventh
+        case .color:    return .diatonicExtensions(maxDegree: 9)
+        default:        return .none
+        }
+    }
+
+    private func applyTensionPolicy(
+        _ policy: TensionPolicy,
+        to baseChordType: ChordType,
+        scaleDegree: Int?,
+        context: HarmonyContext
+    ) throws -> ChordType {
+        switch policy {
+        case .none:
+            return baseChordType
+        case .custom(let intervals):
+            return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: intervals)
+        case .diatonicSeventh:
+            guard let scaleDegree = scaleDegree else { return baseChordType }
+            let extra = try diatonicIntervals(scaleDegree: scaleDegree, scale: context.scale, stackSize: 4)
+            return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: extra)
+        case .diatonicExtensions(let maxDegree):
+            guard let scaleDegree = scaleDegree else { return baseChordType }
+            let stackSize: Int
+            switch maxDegree {
+            case ..<7:   return baseChordType
+            case 7..<9:  stackSize = 4
+            case 9..<11: stackSize = 5
+            case 11..<13: stackSize = 6
+            default:     stackSize = 7
+            }
+            let extra = try diatonicIntervals(scaleDegree: scaleDegree, scale: context.scale, stackSize: stackSize)
+            return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: extra)
+        }
+    }
+
+    private func rebuildChordType(baseIntervals: [Interval], extraIntervals: [Interval]) throws -> ChordType {
+        let merged = Array(Set(baseIntervals + extraIntervals)).sorted()
+        switch ChordType.from(intervals: merged) {
+        case let .success(chordType):
+            return chordType
+        case .failure:
+            throw HarmonyEngineError.unableToResolveChord
+        }
+    }
+
+    // MARK: - Diatonic interval stacking
 
     private func diatonicChordType(scaleDegree: Int, scale: Scale, stackSize: Int) throws -> ChordType {
         let intervals = try diatonicIntervals(scaleDegree: scaleDegree, scale: scale, stackSize: stackSize)
@@ -69,80 +139,23 @@ public struct ChordBuilder: ChordBuilding {
         let rootPitch = Pitch(noteName: root, octave: 4)
         var intervals = [Interval.P1]
 
-        if stackSize <= 1 {
-            return intervals
-        }
-
         for stackIndex in 1..<stackSize {
             let targetIndex = rootIndex + (stackIndex * 2)
             let target = noteNames[targetIndex % noteNames.count]
             let octaveOffset = octaveDiffUp(from: root.letter, steps: stackIndex * 2)
             let targetPitch = Pitch(noteName: target, octave: rootPitch.octave + octaveOffset)
-            let interval = rootPitch.interval(to: targetPitch)
-
-            intervals.append(interval)
+            intervals.append(rootPitch.interval(to: targetPitch))
         }
 
         return intervals
     }
 
-    private func applyTensionPolicy(
-        _ policy: TensionPolicy,
-        to baseChordType: ChordType,
-        root: NoteName,
-        scaleDegree: Int?,
-        context: HarmonyContext
-    ) throws -> ChordType {
-        switch policy {
-        case .none:
-            return baseChordType
-        case .custom(let intervals):
-            return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: intervals)
-        case .diatonicSeventh:
-            guard let scaleDegree = scaleDegree else {
-                return baseChordType
-            }
-            let extra = try diatonicIntervals(scaleDegree: scaleDegree, scale: context.scale, stackSize: 4)
-            return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: extra)
-        case .diatonicExtensions(let maxDegree):
-            guard let scaleDegree = scaleDegree else {
-                return baseChordType
-            }
-            let stackSize: Int
-            switch maxDegree {
-            case ..<7:
-                return baseChordType
-            case 7..<9:
-                stackSize = 4
-            case 9..<11:
-                stackSize = 5
-            case 11..<13:
-                stackSize = 6
-            default:
-                stackSize = 7
-            }
-            let extra = try diatonicIntervals(scaleDegree: scaleDegree, scale: context.scale, stackSize: stackSize)
-            return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: extra)
-        }
-    }
-
-    private func rebuildChordType(baseIntervals: [Interval], extraIntervals: [Interval]) throws -> ChordType {
-        let merged = Array(Set(baseIntervals + extraIntervals)).sorted()
-        switch ChordType.from(intervals: merged) {
-        case let .success(chordType):
-            return chordType
-        case .failure:
-            throw HarmonyEngineError.unableToResolveChord
-        }
-    }
     private func octaveDiffUp(from letter: LetterName, steps: Int) -> Int {
         var diff = 0
         var current = letter
         for _ in 0..<steps {
             let next = current.advanced(by: 1)
-            if current == .b && next == .c {
-                diff += 1
-            }
+            if current == .b && next == .c { diff += 1 }
             current = next
         }
         return diff

@@ -1,6 +1,29 @@
 import Foundation
 import MusicTheory
 
+// MARK: - VoicingConstraints
+
+/// Hard upper bounds on voice movement applied before candidate scoring.
+///
+/// Constraints are "best effort": if no candidate survives filtering, the engine
+/// falls back to the unconstrained pool rather than throwing. This avoids hard
+/// failures when a style profile sets tight limits that can't always be satisfied.
+public struct VoicingConstraints: Hashable, Codable, Sendable {
+    /// Maximum allowed semitone leap for the top upper voice between consecutive chords.
+    /// `nil` means unconstrained.
+    public var maxTopNoteLeap: Int?
+    /// Maximum allowed semitone leap for the bass voice between consecutive chords.
+    /// `nil` means unconstrained.
+    public var maxBassLeap: Int?
+
+    public init(maxTopNoteLeap: Int? = nil, maxBassLeap: Int? = nil) {
+        self.maxTopNoteLeap = maxTopNoteLeap
+        self.maxBassLeap = maxBassLeap
+    }
+}
+
+// MARK: - VoicedChord
+
 /// The register-placed output of `VoiceLeadingEngine`.
 ///
 /// Bass and upper voices are stored separately so the app can route them to different
@@ -31,6 +54,8 @@ public struct VoicedChord: Hashable, Codable, Sendable {
     }
 }
 
+// MARK: - VoiceLeading protocol
+
 /// Converts a `Chord` into a register-specific `VoicedChord`.
 public protocol VoiceLeading {
     /// Voices a chord, optionally minimising movement from a previous voicing.
@@ -42,6 +67,8 @@ public protocol VoiceLeading {
     ///   - context: The harmonic environment supplying register constraints.
     ///   - policy: Controls which inversion is selected.
     ///   - role: Optional harmonic function that biases voicing decisions.
+    ///   - constraints: Optional hard limits on voice movement. Candidates that violate
+    ///     these are filtered before scoring; if all are eliminated the full pool is used.
     /// - Returns: A `VoicedChord` placed within the context's register ranges.
     /// - Throws: `HarmonyEngineError.voicingOutOfRange` if no valid voicing exists.
     func voice(
@@ -49,21 +76,74 @@ public protocol VoiceLeading {
         previous: VoicedChord?,
         context: HarmonyContext,
         policy: InversionPolicy,
-        role: HarmonyRole?
+        role: HarmonyRole?,
+        constraints: VoicingConstraints?
     ) throws -> VoicedChord
 }
 
 public extension VoiceLeading {
-    /// Convenience overload that omits `role`, equivalent to passing `role: nil`.
+    /// Convenience overload omitting `constraints`, equivalent to passing `constraints: nil`.
+    func voice(
+        chord: Chord,
+        previous: VoicedChord?,
+        context: HarmonyContext,
+        policy: InversionPolicy,
+        role: HarmonyRole?
+    ) throws -> VoicedChord {
+        try voice(chord: chord, previous: previous, context: context, policy: policy, role: role, constraints: nil)
+    }
+
+    /// Convenience overload omitting `role` and `constraints`.
     func voice(
         chord: Chord,
         previous: VoicedChord?,
         context: HarmonyContext,
         policy: InversionPolicy
     ) throws -> VoicedChord {
-        try voice(chord: chord, previous: previous, context: context, policy: policy, role: nil)
+        try voice(chord: chord, previous: previous, context: context, policy: policy, role: nil, constraints: nil)
+    }
+
+    /// Voices a sequence of recipes in order, threading each `VoicedChord` as the
+    /// `previous` context for the next step.
+    ///
+    /// This is the primary entry point for building a voiced progression. The app
+    /// retains full control over timing, velocity, and MIDI channel routing.
+    ///
+    /// - Parameters:
+    ///   - recipes: Ordered list of chord recipes to build and voice.
+    ///   - context: The shared harmonic environment for all steps.
+    ///   - builder: The chord builder to use. Defaults to `ChordBuilder()`.
+    ///   - constraints: Optional hard voice-movement limits applied to every step.
+    /// - Returns: A `VoicedChord` for each recipe, in the same order.
+    /// - Throws: Any error from `ChordBuilding` or `VoiceLeading`.
+    func voice(
+        recipes: [ChordRecipe],
+        context: HarmonyContext,
+        builder: ChordBuilding = ChordBuilder(),
+        constraints: VoicingConstraints? = nil
+    ) throws -> [VoicedChord] {
+        var previous: VoicedChord?
+        var result = [VoicedChord]()
+
+        for recipe in recipes {
+            let chord = try builder.buildChord(recipe: recipe, context: context)
+            let voiced = try voice(
+                chord: chord,
+                previous: previous,
+                context: context,
+                policy: recipe.inversionPolicy,
+                role: recipe.role,
+                constraints: constraints
+            )
+            result.append(voiced)
+            previous = voiced
+        }
+
+        return result
     }
 }
+
+// MARK: - VoiceLeadingEngine
 
 /// Default implementation of `VoiceLeading`.
 ///
@@ -75,6 +155,10 @@ public extension VoiceLeading {
 /// - Bass distance outside the bass register (weighted ×4 per semitone).
 /// - Role-based bias (see `HarmonyRole`).
 ///
+/// Hard `VoicingConstraints` are applied before scoring: candidates that violate
+/// `maxTopNoteLeap` or `maxBassLeap` are removed from the pool. If all candidates
+/// are eliminated, the engine falls back to the unconstrained pool.
+///
 /// The lowest-scoring candidate is selected. Ties are broken by inversion index, then bass
 /// pitch, then top pitch.
 public struct VoiceLeadingEngine: VoiceLeading {
@@ -85,11 +169,21 @@ public struct VoiceLeadingEngine: VoiceLeading {
         previous: VoicedChord?,
         context: HarmonyContext,
         policy: InversionPolicy,
-        role: HarmonyRole? = nil
+        role: HarmonyRole? = nil,
+        constraints: VoicingConstraints? = nil
     ) throws -> VoicedChord {
-        let candidates = try makeCandidates(chord: chord, context: context, policy: policy)
-        guard !candidates.isEmpty else {
+        let allCandidates = try makeCandidates(chord: chord, context: context, policy: policy)
+        guard !allCandidates.isEmpty else {
             throw HarmonyEngineError.voicingOutOfRange
+        }
+
+        // Apply hard constraints; fall back to full pool if all candidates are eliminated.
+        let candidates: [VoicingCandidate]
+        if let constraints = constraints, let previous = previous {
+            let filtered = filter(candidates: allCandidates, by: constraints, previous: previous)
+            candidates = filtered.isEmpty ? allCandidates : filtered
+        } else {
+            candidates = allCandidates
         }
 
         switch policy {
@@ -104,6 +198,26 @@ public struct VoiceLeadingEngine: VoiceLeading {
                 if lhsScore != rhsScore { return lhsScore < rhsScore }
                 return nearestTieBreak(lhs: lhs, rhs: rhs)
             }.first!.voicedChord
+        }
+    }
+
+    // MARK: - Constraint filtering
+
+    private func filter(
+        candidates: [VoicingCandidate],
+        by constraints: VoicingConstraints,
+        previous: VoicedChord
+    ) -> [VoicingCandidate] {
+        candidates.filter { candidate in
+            if let maxTopLeap = constraints.maxTopNoteLeap {
+                let leap = abs(candidate.voicedChord.topPitch.midiNoteNumber - previous.topPitch.midiNoteNumber)
+                guard leap <= maxTopLeap else { return false }
+            }
+            if let maxBassLeap = constraints.maxBassLeap {
+                let leap = abs(candidate.voicedChord.bassVoice.midiNoteNumber - previous.bassVoice.midiNoteNumber)
+                guard leap <= maxBassLeap else { return false }
+            }
+            return true
         }
     }
 

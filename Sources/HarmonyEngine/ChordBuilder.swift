@@ -60,15 +60,37 @@ public struct ChordBuilder: ChordBuilding {
 
     /// Returns the explicit chord type, or infers the diatonic quality from the scale.
     /// Inference is only supported for heptatonic (7-note) scales and requires `scaleDegree`.
+    /// For non-heptatonic scales, quality is inferred from pitch-class presence in the scale.
     private func resolveChordType(recipe: ChordRecipe, context: HarmonyContext) throws -> ChordType {
         if let chordType = recipe.chordType { return chordType }
         guard let scaleDegree = recipe.scaleDegree else {
             throw HarmonyEngineError.missingChordSource
         }
+        guard scaleDegree >= 1, scaleDegree <= context.scale.noteNames.count else {
+            throw HarmonyEngineError.invalidScaleDegree(scaleDegree)
+        }
         guard context.scale.noteNames.count == 7 else {
-            throw HarmonyEngineError.unableToResolveChord
+            return inferChordType(scaleDegree: scaleDegree, scale: context.scale)
         }
         return try diatonicChordType(scaleDegree: scaleDegree, scale: context.scale, stackSize: 3)
+    }
+
+    /// Infers a chord type for non-heptatonic scales by checking which intervals
+    /// are present in the scale above the given root degree.
+    private func inferChordType(scaleDegree: Int, scale: Scale) -> ChordType {
+        let root = scale.noteNames[scaleDegree - 1]
+        let pcs = Set(scale.noteNames.map(\.pitchClass))
+        let r = root.pitchClass
+        let hasMin3 = pcs.contains((r + 3) % 12)
+        let hasMaj3 = pcs.contains((r + 4) % 12)
+        let hasDim5 = pcs.contains((r + 6) % 12) && !pcs.contains((r + 7) % 12)
+        let hasP5   = pcs.contains((r + 7) % 12)
+        var components = Set<ChordComponent>()
+        if hasMin3      { components.insert(.minorThird) }
+        else if hasMaj3 { components.insert(.majorThird) }
+        if hasDim5      { components.insert(.diminishedFifth) }
+        else if hasP5   { components.insert(.perfectFifth) }
+        return ChordType(components: components) ?? (hasMin3 ? .minor : .major)
     }
 
     // MARK: - Tension policy
@@ -99,11 +121,13 @@ public struct ChordBuilder: ChordBuilding {
         case .custom(let intervals):
             return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: intervals)
         case .diatonicSeventh:
-            guard let scaleDegree = scaleDegree else { return baseChordType }
+            guard let scaleDegree = scaleDegree,
+                  context.scale.noteNames.count == 7 else { return baseChordType }
             let extra = try diatonicIntervals(scaleDegree: scaleDegree, scale: context.scale, stackSize: 4)
             return try rebuildChordType(baseIntervals: baseChordType.intervals, extraIntervals: extra)
         case .diatonicExtensions(let maxDegree):
-            guard let scaleDegree = scaleDegree else { return baseChordType }
+            guard let scaleDegree = scaleDegree,
+                  context.scale.noteNames.count == 7 else { return baseChordType }
             let stackSize: Int
             switch maxDegree {
             case ..<7:    return baseChordType
@@ -145,26 +169,24 @@ public struct ChordBuilder: ChordBuilding {
         let root = noteNames[rootIndex]
         let rootPitch = Pitch(noteName: root, octave: 4)
         var intervals = [Interval.P1]
+        var floorMidi = rootPitch.midiNoteNumber
 
         for stackIndex in 1..<stackSize {
             let targetIndex = rootIndex + (stackIndex * 2)
             let target = noteNames[targetIndex % noteNames.count]
-            let octaveOffset = octaveDiffUp(from: root.letter, steps: stackIndex * 2)
-            let targetPitch = Pitch(noteName: target, octave: rootPitch.octave + octaveOffset)
-            intervals.append(rootPitch.interval(to: targetPitch))
+            // Start from an octave estimate based on full scale-cycle wraps, then
+            // bump up until the target sits strictly above the previous voice.
+            // This is correct for any scale size, not just heptatonic.
+            var octave = rootPitch.octave + (targetIndex / noteNames.count)
+            var candidate = Pitch(noteName: target, octave: octave)
+            while candidate.midiNoteNumber <= floorMidi {
+                octave += 1
+                candidate = Pitch(noteName: target, octave: octave)
+            }
+            floorMidi = candidate.midiNoteNumber
+            intervals.append(rootPitch.interval(to: candidate))
         }
 
         return intervals
-    }
-
-    private func octaveDiffUp(from letter: LetterName, steps: Int) -> Int {
-        var diff = 0
-        var current = letter
-        for _ in 0..<steps {
-            let next = current.advanced(by: 1)
-            if current == .b && next == .c { diff += 1 }
-            current = next
-        }
-        return diff
     }
 }

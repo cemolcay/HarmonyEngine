@@ -22,6 +22,71 @@ public struct VoicingConstraints: Hashable, Codable, Sendable {
     }
 }
 
+// MARK: - VoicingOptions
+
+/// The shape of the upper voices.
+public enum VoicingStyle: String, Hashable, Codable, Sendable, CaseIterable {
+    /// Chord tones stacked in chord-tone order, each one above the previous one.
+    case close
+    /// Close voicing with the second voice from the top one octave lower.
+    case drop2
+    /// Close voicing with the third voice from the top one octave lower. Needs 4 voices.
+    case drop3
+    /// Close voicing with the second and fourth voices from the top one octave lower. Needs 4 voices.
+    case drop2and4
+    /// Open voicing: every second voice from the bottom goes one octave higher.
+    case spread
+    /// Only the third (or suspension) and the seventh (or sixth). The bass plays the root.
+    case shell
+    /// Close voicing without the root. The bass plays the root.
+    case rootless
+}
+
+/// Tells which note the bass voice plays.
+public enum BassMode: String, Hashable, Codable, Sendable {
+    /// The slash bass of the chord, or else the chord tone of its inversion.
+    case chordBass
+    /// Always the chord root, also when the upper voices are inverted.
+    case root
+}
+
+/// Settings of `VoiceLeadingEngine`.
+///
+/// The defaults give the same result as the first engine version: close voicing, the bass follows the
+/// inversion, and the bass pitch class is also in the upper voices.
+public struct VoicingOptions: Hashable, Codable, Sendable {
+    /// The shape of the upper voices.
+    public var style: VoicingStyle
+    /// The maximum number of upper voices. When a chord has more tones, the engine removes them in this
+    /// order: the perfect 5th, the root, the 11th, the 9th. It always keeps at least 2 voices.
+    public var maxVoices: Int?
+    /// Which note the bass plays. `.shell` and `.rootless` voicings are usually used with `.root`.
+    public var bassMode: BassMode
+    /// When `false`, the upper voices do not play the bass pitch class (if 2 or more voices stay).
+    public var doublesBassInUpperVoices: Bool
+    /// A MIDI note that the top voice moves toward. Each semitone of distance adds 1 to the score.
+    public var topVoiceTarget: Int?
+    /// How strongly the voicing moves toward the middle of the preferred register.
+    /// Each semitone between the average upper voice and the middle adds this value to the score.
+    public var registerCenterWeight: Double
+
+    public init(
+        style: VoicingStyle = .close,
+        maxVoices: Int? = nil,
+        bassMode: BassMode = .chordBass,
+        doublesBassInUpperVoices: Bool = true,
+        topVoiceTarget: Int? = nil,
+        registerCenterWeight: Double = 0
+    ) {
+        self.style = style
+        self.maxVoices = maxVoices
+        self.bassMode = bassMode
+        self.doublesBassInUpperVoices = doublesBassInUpperVoices
+        self.topVoiceTarget = topVoiceTarget
+        self.registerCenterWeight = registerCenterWeight
+    }
+}
+
 // MARK: - VoicedChord
 
 /// The register-placed output of `VoiceLeadingEngine`.
@@ -141,6 +206,51 @@ public extension VoiceLeading {
 
         return result
     }
+
+    /// Voices a sequence of chord specs in order, threading each `VoicedChord` as the
+    /// `previous` context for the next step.
+    ///
+    /// A spec with `bass: .inversion(k)` always uses inversion `k` (`.fixed(k)`). The other specs use `policy`.
+    ///
+    /// - Parameters:
+    ///   - specs: Ordered list of chord specs to build and voice.
+    ///   - context: The shared harmonic environment for all steps.
+    ///   - policy: The inversion policy of the specs without a fixed inversion. Defaults to `.nearest`.
+    ///   - builder: The chord builder to use. Defaults to `ChordBuilder()`.
+    ///   - constraints: Optional hard voice-movement limits applied to every step.
+    /// - Returns: A `VoicedChord` for each spec, in the same order.
+    func voice(
+        specs: [ChordSpec],
+        context: HarmonyContext,
+        policy: InversionPolicy = .nearest,
+        builder: ChordBuilder = ChordBuilder(),
+        constraints: VoicingConstraints? = nil
+    ) throws -> [VoicedChord] {
+        var previous: VoicedChord?
+        var result = [VoicedChord]()
+
+        for spec in specs {
+            let chord = try builder.buildChord(spec: spec, context: context)
+            let stepPolicy: InversionPolicy
+            if case .inversion(let inversion) = spec.bass {
+                stepPolicy = .fixed(inversion)
+            } else {
+                stepPolicy = policy
+            }
+            let voiced = try voice(
+                chord: chord,
+                previous: previous,
+                context: context,
+                policy: stepPolicy,
+                role: nil,
+                constraints: constraints
+            )
+            result.append(voiced)
+            previous = voiced
+        }
+
+        return result
+    }
 }
 
 // MARK: - VoiceLeadingEngine
@@ -148,21 +258,40 @@ public extension VoiceLeading {
 /// Default implementation of `VoiceLeading`.
 ///
 /// ## Algorithm
-/// For each inversion of the chord, pitches are placed across candidate octaves within the
-/// preferred register. Each valid voicing is scored by:
-/// - Total semitone movement across upper voices from the previous chord.
-/// - Top-voice leap (weighted ×1.5).
-/// - Bass distance outside the bass register (weighted ×4 per semitone).
-/// - Role-based bias (see `HarmonyRole`).
+/// For each allowed inversion, the engine:
+/// 1. Takes the chord tones from the inversion tone, and removes tones for the voicing style,
+///    `maxVoices`, and `doublesBassInUpperVoices`.
+/// 2. Stacks the tones in chord-tone order (each tone above the previous one), then applies the style
+///    (for example drop 2).
+/// 3. Places the shape in every octave that keeps all upper voices in the preferred register.
+/// 4. Places the bass in the bass register, near the previous bass (or near the middle of the register
+///    when there is no previous chord).
 ///
-/// Hard `VoicingConstraints` are applied before scoring: candidates that violate
-/// `maxTopNoteLeap` or `maxBassLeap` are removed from the pool. If all candidates
-/// are eliminated, the engine falls back to the unconstrained pool.
+/// Each candidate gets a score. The score adds:
+/// - the voice movement of the upper voices from the previous chord (`VoiceLeadingDistance`),
+///   plus 3 for each voice that is added or removed,
+/// - the top-voice leap (×1.5),
+/// - the bass distance outside the bass register (×4 per semitone),
+/// - the role bias (see `HarmonyRole`),
+/// - the distance to `VoicingOptions.topVoiceTarget` and to the register middle (when set).
 ///
-/// The lowest-scoring candidate is selected. Ties are broken by inversion index, then bass
-/// pitch, then top pitch.
+/// Hard `VoicingConstraints` are applied before scoring. If all candidates are eliminated,
+/// the engine falls back to the unconstrained pool.
+///
+/// Selection by policy:
+/// - `.nearest`: the lowest score from all inversions.
+/// - `.rootPosition`, `.fixed`: the lowest score from the candidates of that inversion.
+/// - `.keepClose`: the lowest inversion, then the lowest bass, then the lowest top voice.
+///   It does not use the score.
+///
+/// Ties are broken by inversion index, then bass pitch, then top pitch.
 public struct VoiceLeadingEngine: VoiceLeading {
-    public init() {}
+    /// The voicing settings.
+    public var options: VoicingOptions
+
+    public init(options: VoicingOptions = VoicingOptions()) {
+        self.options = options
+    }
 
     public func voice(
         chord: Chord,
@@ -172,7 +301,7 @@ public struct VoiceLeadingEngine: VoiceLeading {
         role: HarmonyRole? = nil,
         constraints: VoicingConstraints? = nil
     ) throws -> VoicedChord {
-        let allCandidates = try makeCandidates(chord: chord, context: context, policy: policy)
+        let allCandidates = makeCandidates(chord: chord, previous: previous, context: context, policy: policy)
         guard !allCandidates.isEmpty else {
             throw HarmonyEngineError.voicingOutOfRange
         }
@@ -187,17 +316,14 @@ public struct VoiceLeadingEngine: VoiceLeading {
         }
 
         switch policy {
-        case .rootPosition, .fixed:
-            return candidates[0].voicedChord
         case .keepClose:
-            return candidates.sorted(by: keepCloseSort).first!.voicedChord
-        case .nearest:
-            return candidates.sorted { lhs, rhs in
-                let lhsScore = score(candidate: lhs, previous: previous, context: context, role: role)
-                let rhsScore = score(candidate: rhs, previous: previous, context: context, role: role)
-                if lhsScore != rhsScore { return lhsScore < rhsScore }
-                return nearestTieBreak(lhs: lhs, rhs: rhs)
-            }.first!.voicedChord
+            return candidates.sorted(by: tieBreak).first!.voicedChord
+        case .rootPosition, .fixed, .nearest:
+            let scored = candidates.map { ($0, score(candidate: $0, previous: previous, context: context, role: role)) }
+            return scored.min { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 < rhs.1 }
+                return tieBreak(lhs: lhs.0, rhs: rhs.0)
+            }!.0.voicedChord
         }
     }
 
@@ -225,26 +351,22 @@ public struct VoiceLeadingEngine: VoiceLeading {
 
     private func makeCandidates(
         chord: Chord,
+        previous: VoicedChord?,
         context: HarmonyContext,
         policy: InversionPolicy
-    ) throws -> [VoicingCandidate] {
-        let inversions = filteredInversions(for: chord, policy: policy)
-        let octaveRange = candidateOctaves(for: context.preferredRegister)
+    ) -> [VoicingCandidate] {
         var candidates = [VoicingCandidate]()
 
-        for inversion in inversions {
-            for octave in octaveRange {
-                let voicePitches = inversion.pitches(octave: octave).sorted()
-                guard voicePitches.allSatisfy({ context.preferredRegister.contains($0.midiNoteNumber) }) else {
-                    continue
-                }
+        for inverted in filteredInversions(for: chord, policy: policy) {
+            let (tones, bassNote) = upperTonesAndBass(for: inverted)
+            guard !tones.isEmpty else { continue }
+            let shape = applyStyle(to: stack(tones))
+            let bassVoice = bestBassPitch(for: bassNote, previous: previous, context: context)
 
-                let bassVoice = bestBassPitch(for: voicePitches[0], context: context)
-
-                if let voicedChord = VoicedChord(chord: inversion, upperVoices: voicePitches, bassVoice: bassVoice) {
-                    candidates.append(
-                        VoicingCandidate(voicedChord: voicedChord, inversion: inversion.inversion)
-                    )
+            for shift in octaveShifts(for: shape, in: context.preferredRegister) {
+                let voices = shape.map { Pitch(noteName: $0.noteName, octave: $0.octave + shift) }
+                if let voicedChord = VoicedChord(chord: inverted, upperVoices: voices, bassVoice: bassVoice) {
+                    candidates.append(VoicingCandidate(voicedChord: voicedChord, inversion: inverted.inversion))
                 }
             }
         }
@@ -260,36 +382,124 @@ public struct VoiceLeadingEngine: VoiceLeading {
         }
     }
 
-    private func candidateOctaves(for preferredRegister: PitchRange) -> ClosedRange<Int> {
-        let minOctave = max(0, (preferredRegister.minMidi / 12) - 2)
-        let maxOctave = preferredRegister.maxMidi / 12
-        return minOctave...maxOctave
-    }
+    /// The upper chord tones in voicing order (from the inversion tone), and the bass note.
+    private func upperTonesAndBass(for chord: Chord) -> ([(note: NoteName, interval: Interval)], NoteName) {
+        let rootPosition = Array(zip(chord.noteNames, chord.type.intervals)).map { (note: $0.0, interval: $0.1) }
+        guard !rootPosition.isEmpty else { return ([], chord.root) }
+        let inversion = min(max(chord.inversion, 0), rootPosition.count - 1)
+        var tones = Array(rootPosition[inversion...] + rootPosition[..<inversion])
 
-    /// Finds the pitch in the bass register whose pitch class matches `source`,
-    /// placing it closest to the register's midpoint.
-    private func bestBassPitch(for source: Pitch, context: HarmonyContext) -> Pitch {
-        let midiClass = ((source.midiNoteNumber % 12) + 12) % 12
-        var candidates = [Pitch]()
+        let bassNote: NoteName
+        if let slash = chord.bass {
+            bassNote = slash
+        } else if options.bassMode == .root {
+            bassNote = chord.root
+        } else {
+            bassNote = tones[0].note
+        }
 
-        for midi in context.bassRegister.minMidi...context.bassRegister.maxMidi {
-            if ((midi % 12) + 12) % 12 == midiClass {
-                candidates.append(Pitch(midiNote: midi, spelling: preferredSpelling(for: source.noteName)))
+        // Style omissions.
+        switch options.style {
+        case .shell:
+            let hasSeventh = tones.contains { $0.interval.degree == 7 }
+            let shell = tones.filter { tone in
+                switch tone.interval.degree {
+                case 3, 7: return true
+                case 2, 4: return !tones.contains { $0.interval.degree == 3 }
+                case 6:    return !hasSeventh
+                default:   return false
+                }
+            }
+            if shell.count >= 2 { tones = shell }
+        case .rootless:
+            if tones.count > 2 { tones.removeAll { $0.interval == .P1 } }
+        case .close, .drop2, .drop3, .drop2and4, .spread:
+            break
+        }
+
+        // Voice count limit.
+        if let maxVoices = options.maxVoices {
+            for omitted in [Interval.P5, .P1, .P11, .M9] where tones.count > max(maxVoices, 2) {
+                tones.removeAll { $0.interval == omitted }
             }
         }
 
-        guard !candidates.isEmpty else { return source }
+        // Bass doubling.
+        if !options.doublesBassInUpperVoices {
+            let withoutBass = tones.filter { $0.note.pitchClass != bassNote.pitchClass }
+            if withoutBass.count >= 2 { tones = withoutBass }
+        }
 
-        let targetMidi = Int(context.bassRegister.midpoint.rounded())
-        return candidates.min {
-            let ld = abs($0.midiNoteNumber - targetMidi)
-            let rd = abs($1.midiNoteNumber - targetMidi)
-            return ld != rd ? ld < rd : $0.midiNoteNumber < $1.midiNoteNumber
-        }!
+        return (tones, bassNote)
     }
 
-    private func preferredSpelling(for noteName: NoteName) -> SpellingPreference {
-        noteName.accidental.semitones < 0 ? .flats : .sharps
+    /// Stacks the tones in order, each one in the nearest octave above the previous one.
+    private func stack(_ tones: [(note: NoteName, interval: Interval)]) -> [Pitch] {
+        var pitches = [Pitch]()
+        for tone in tones {
+            guard let previous = pitches.last else {
+                pitches.append(Pitch(noteName: tone.note, octave: 4))
+                continue
+            }
+            var candidate = Pitch(noteName: tone.note, octave: previous.octave)
+            while candidate.midiNoteNumber <= previous.midiNoteNumber {
+                candidate = Pitch(noteName: tone.note, octave: candidate.octave + 1)
+            }
+            pitches.append(candidate)
+        }
+        return pitches
+    }
+
+    /// Applies the style to a stacked (ascending) voicing, and sorts the result.
+    private func applyStyle(to stacked: [Pitch]) -> [Pitch] {
+        var voices = stacked
+        let count = voices.count
+
+        func move(_ index: Int, octaves: Int) {
+            guard voices.indices.contains(index) else { return }
+            voices[index] = Pitch(noteName: voices[index].noteName, octave: voices[index].octave + octaves)
+        }
+
+        switch options.style {
+        case .close, .shell, .rootless:
+            break
+        case .drop2:
+            if count >= 3 { move(count - 2, octaves: -1) }
+        case .drop3:
+            if count >= 4 { move(count - 3, octaves: -1) }
+        case .drop2and4:
+            if count >= 4 {
+                move(count - 2, octaves: -1)
+                move(count - 4, octaves: -1)
+            }
+        case .spread:
+            for index in stride(from: 1, to: count, by: 2) { move(index, octaves: 1) }
+        }
+        return voices.sorted()
+    }
+
+    /// The octave shifts that keep every voice of the shape in the register.
+    private func octaveShifts(for shape: [Pitch], in register: PitchRange) -> [Int] {
+        guard let lowest = shape.first?.midiNoteNumber, let highest = shape.last?.midiNoteNumber else { return [] }
+        return (-10...10).filter { shift in
+            register.contains(lowest + shift * 12) && register.contains(highest + shift * 12)
+        }
+    }
+
+    /// Places the bass note in the bass register: near the previous bass, or else near the middle
+    /// of the register. When the register has no pitch of that note, it uses the nearest pitch outside it.
+    private func bestBassPitch(for note: NoteName, previous: VoicedChord?, context: HarmonyContext) -> Pitch {
+        let register = context.bassRegister
+        let target = previous?.bassVoice.midiNoteNumber ?? Int(register.midpoint.rounded())
+        let pitches = (-1...9).map { Pitch(noteName: note, octave: $0) }
+        let inRegister = pitches.filter { register.contains($0.midiNoteNumber) }
+        let pool = inRegister.isEmpty ? pitches : inRegister
+
+        return pool.min {
+            let ld = abs($0.midiNoteNumber - target)
+            let rd = abs($1.midiNoteNumber - target)
+            return ld != rd ? ld < rd : $0.midiNoteNumber < $1.midiNoteNumber
+        }!
     }
 
     // MARK: - Scoring
@@ -300,20 +510,31 @@ public struct VoiceLeadingEngine: VoiceLeading {
         context: HarmonyContext,
         role: HarmonyRole?
     ) -> Double {
-        let bassPenalty = Double(context.bassRegister.distanceOutside(candidate.voicedChord.bassVoice.midiNoteNumber) * 4)
-        let rolePenalty = roleBasedPenalty(candidate: candidate, previous: previous, role: role)
+        let voiced = candidate.voicedChord
+        var score = Double(context.bassRegister.distanceOutside(voiced.bassVoice.midiNoteNumber) * 4)
+        score += roleBasedPenalty(candidate: candidate, previous: previous, role: role)
 
-        guard let previous = previous else {
-            return bassPenalty + rolePenalty
+        if let previous {
+            let movement = VoiceLeadingDistance.between(
+                previous.upperVoices.map(\.midiNoteNumber),
+                voiced.upperVoices.map(\.midiNoteNumber)
+            )
+            let voiceCountPenalty = abs(voiced.upperVoices.count - previous.upperVoices.count) * 3
+            let topLeap = abs(voiced.topPitch.midiNoteNumber - previous.topPitch.midiNoteNumber)
+            score += Double(movement + voiceCountPenalty) + Double(topLeap) * 1.5
         }
 
-        let movement = zip(candidate.voicedChord.upperVoices, previous.upperVoices).reduce(0) { acc, pair in
-            acc + abs(pair.0.midiNoteNumber - pair.1.midiNoteNumber)
+        if let target = options.topVoiceTarget {
+            score += Double(abs(voiced.topPitch.midiNoteNumber - target))
         }
-        let voiceCountPenalty = abs(candidate.voicedChord.upperVoices.count - previous.upperVoices.count) * 12
-        let topLeap = abs(candidate.voicedChord.topPitch.midiNoteNumber - previous.topPitch.midiNoteNumber)
 
-        return Double(movement + voiceCountPenalty) + (Double(topLeap) * 1.5) + bassPenalty + rolePenalty
+        if options.registerCenterWeight > 0 {
+            let voices = voiced.upperVoices.map(\.midiNoteNumber)
+            let center = Double(voices.reduce(0, +)) / Double(voices.count)
+            score += abs(center - context.preferredRegister.midpoint) * options.registerCenterWeight
+        }
+
+        return score
     }
 
     private func roleBasedPenalty(
@@ -341,15 +562,7 @@ public struct VoiceLeadingEngine: VoiceLeading {
 
     // MARK: - Sorting helpers
 
-    private func keepCloseSort(lhs: VoicingCandidate, rhs: VoicingCandidate) -> Bool {
-        if lhs.inversion != rhs.inversion { return lhs.inversion < rhs.inversion }
-        let lb = lhs.voicedChord.bassVoice.midiNoteNumber
-        let rb = rhs.voicedChord.bassVoice.midiNoteNumber
-        if lb != rb { return lb < rb }
-        return lhs.voicedChord.topPitch.midiNoteNumber < rhs.voicedChord.topPitch.midiNoteNumber
-    }
-
-    private func nearestTieBreak(lhs: VoicingCandidate, rhs: VoicingCandidate) -> Bool {
+    private func tieBreak(lhs: VoicingCandidate, rhs: VoicingCandidate) -> Bool {
         if lhs.inversion != rhs.inversion { return lhs.inversion < rhs.inversion }
         let lb = lhs.voicedChord.bassVoice.midiNoteNumber
         let rb = rhs.voicedChord.bassVoice.midiNoteNumber

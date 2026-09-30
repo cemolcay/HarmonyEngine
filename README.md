@@ -26,12 +26,18 @@ HarmonyEngine/
   Sources/HarmonyEngine/
     HarmonyContext.swift      — HarmonyContext, HarmonyRole, PitchRange
     ChordRecipe.swift         — ChordRecipe, InversionPolicy, TensionPolicy
-    ChordBuilder.swift        — ChordBuilding protocol + ChordBuilder
-    VoiceLeadingEngine.swift  — VoiceLeading protocol + VoiceLeadingEngine, VoicedChord
+    ChordSpec.swift           — ChordSpec, ChordRoot, ChordBass (chromatic chords)
+    ChordBuilder.swift        — ChordBuilding protocol + ChordBuilder, AvoidNotePolicy
+    ChordNamer.swift          — Roman numeral and chord symbol names
+    VoiceLeadingEngine.swift  — VoiceLeading protocol + VoiceLeadingEngine, VoicedChord, VoicingOptions
+    ScaleFit.swift            — ScaleFit, VoiceLeadingDistance
+    TransitionMetrics.swift   — measures of the move between two chords
     HarmonicPalette.swift     — diatonic chord catalog and role-based queries
     Errors.swift              — HarmonyEngineError
   Tests/HarmonyEngineTests/
     HarmonyEngineTests.swift
+    ChordSpecTests.swift
+    VoicingTests.swift
 ```
 
 ## Core Types
@@ -86,9 +92,11 @@ let recipe = ChordRecipe(root: .f, chordType: .major7)
 | Case | Behavior |
 |---|---|
 | `.rootPosition` | Always inversion 0 |
-| `.keepClose` | Lowest inversion that fits the register cleanly |
-| `.nearest` | Minimum voice movement from the previous chord |
-| `.fixed(Int)` | Exact inversion index |
+| `.keepClose` | Lowest inversion, then the lowest placement in the register (no scoring) |
+| `.nearest` | Lowest score from all inversions (minimum voice movement from the previous chord) |
+| `.fixed(Int)` | Exact inversion index; the octave with the lowest score |
+
+`.rootPosition` and `.fixed` also score their candidates, so they follow the previous chord.
 
 ### `TensionPolicy`
 
@@ -97,8 +105,79 @@ let recipe = ChordRecipe(root: .f, chordType: .major7)
 | `nil` | Defer to role default |
 | `.none` | No tension — use chord type as-is |
 | `.diatonicSeventh` | Add the diatonic 7th from the scale |
-| `.diatonicExtensions(maxDegree:)` | Stack diatonic extensions up to the given degree (7, 9, 11, 13) |
+| `.diatonicExtensions(maxDegree:)` | Stack diatonic extensions up to the given degree (7, 9, 11, 13). Avoid notes are removed (see `AvoidNotePolicy`) |
 | `.custom([Interval])` | Merge arbitrary intervals into the chord |
+
+### `ChordSpec`
+
+Describes a chord relative to the context, including chromatic chords. It transposes with the key and scale.
+
+```swift
+ChordSpec.degree(2, tension: .diatonicSeventh)              // ii7
+ChordSpec(root: .degree(7, alteration: -1), type: .major)    // ♭VII (explicit type)
+ChordSpec(root: .borrowed(degree: 6, from: .minor))          // ♭VI from the parallel minor
+ChordSpec(root: .applied(.dominant, of: 2))                  // V7/ii
+ChordSpec(root: .applied(.leadingTone, of: 5))               // vii°7/V
+ChordSpec(root: .applied(.tritoneSubstitute, of: 1))         // subV7/I
+ChordSpec(root: .applied(.supertonic, of: 5))                // ii7/V
+ChordSpec(root: .neapolitan, bass: .inversion(1))            // N6
+ChordSpec(root: .augmentedSixth(.german))                    // Ger+6
+ChordSpec(root: .commonToneDiminished(of: 1))                // CT°7/I
+ChordSpec(root: .degree(1), bass: .scaleDegree(3))           // I/3 (slash bass)
+```
+
+| Root | Default type when `type` is `nil` |
+|---|---|
+| `.degree(n)`, `.borrowed` | Diatonic triad of the source scale |
+| `.degree(n, alteration:)` with an alteration | None: throws `missingChordType` |
+| `.applied(.dominant / .tritoneSubstitute, of:)` | Dominant 7th |
+| `.applied(.leadingTone, of:)` | Diminished 7th |
+| `.applied(.supertonic, of:)` | Minor 7th, or half-diminished 7th when the target is minor |
+| `.neapolitan` | Major triad |
+| `.augmentedSixth` | It: ♭6–1–♯4, Fr: ♭6–1–2–♯4, Ger: ♭6–1–♭3–♯4 (the ♯4 is spelled as a ♭7) |
+| `.commonToneDiminished` | Diminished 7th on the target root |
+
+`ChordRoot.resolutionTarget` gives the degree that the chord normally resolves to (for example 2 for V/ii, 5 for N6).
+
+```swift
+let chord = try ChordBuilder().buildChord(spec: spec, context: context)
+let name  = try ChordNamer().name(spec: spec, context: context)   // name.roman == "V7/ii", name.symbol == "A7"
+```
+
+### `AvoidNotePolicy`
+
+`ChordBuilder(avoidNotes:)` controls diatonic extension stacking. The default `.omit` removes the natural 11th over a major 3rd, and the ♭9th and ♭13th over chords that are not dominant 7ths. `.keep` keeps all stacked notes.
+
+### `VoicingOptions`
+
+`VoiceLeadingEngine(options:)` sets the voicing shape. The defaults give the close voicing of the first version.
+
+| Option | Behavior |
+|---|---|
+| `style` | `.close`, `.drop2`, `.drop3`, `.drop2and4`, `.spread`, `.shell` (3rd and 7th), `.rootless` |
+| `maxVoices` | Removes the 5th, then the root, the 11th, the 9th, until the count fits (at least 2 voices) |
+| `bassMode` | `.chordBass` (slash bass or inversion tone) or `.root` |
+| `doublesBassInUpperVoices` | `false` removes the bass pitch class from the upper voices |
+| `topVoiceTarget` | A MIDI note that the top voice moves toward |
+| `registerCenterWeight` | Moves the voicing toward the middle of the preferred register |
+
+The bass goes to the pitch nearest to the previous bass. Voice movement uses `VoiceLeadingDistance`: sorted voices for the same voice count, or the smallest split/merge movement for different voice counts.
+
+### `ScaleFit` and `TransitionMetrics`
+
+```swift
+ScaleFit.isDiatonic(chord, in: context.scale)
+ScaleFit.outsidePitchClasses(of: chord, in: context.scale)
+
+let metrics = TransitionMetrics(from: previousChord, to: chord, scale: context.scale)
+metrics.rootMotion            // 0–11 semitones up
+metrics.commonTones
+metrics.voiceLeadingDistance
+metrics.tension               // semitone, major 7th, and tritone pairs in the target chord
+metrics.outsideNotes
+```
+
+A suggestion layer can combine these values into a score. They contain no style rules.
 
 ### `VoicedChord`
 
@@ -199,17 +278,22 @@ enum HarmonyEngineError: Error {
     case invalidPitchRange(minMidi: Int, maxMidi: Int)
     case voicingOutOfRange
     case unableToResolveChord
+    case missingChordType
+    case invalidInversion(Int)
 }
 ```
 
 No silent fallbacks — errors are thrown when harmonic intent cannot be resolved.
+For scales that do not have 7 notes, a chord with no explicit type needs a third and a fifth in the scale.
+
+`ChordSpec` adds two errors: `missingChordType` (an altered degree without a type) and `invalidInversion(Int)`.
 
 ## Non-Goals
 
 - Progression sequencing or beat/bar timing
 - MIDI event scheduling (start time, duration, velocity, channel)
 - Genre presets or taste rules
-- Chord recognition or roman numeral analysis
+- Chord recognition from notes (`ChordNamer` names a known `ChordSpec`; it does not analyse note lists)
 - Reharmonization or AI suggestions
 - DAW transport sync or plugin state
 - UI or persistence

@@ -66,15 +66,17 @@ Owns decision-making without taste:
 - how a chord is named in a key
 - how two chords compare (common tones, root motion, voice movement, tension)
 
-### `HarmonySuggest` (planned, separate target in this package)
+### `HarmonySuggest` (separate target in this package)
 
 Owns taste:
 
-- style profiles (data)
-- candidate generation and ranking of the next chord
-- progression generation
+- style profiles (Codable data, generated from the Harmonicc style tables by `Scripts/convert_harmonicc_styles.py`)
+- candidate generation: diatonic chord flavors on every degree (checked with `ScaleFit`), alterations, and chromatic devices
+- ranking of the next chord (`SuggestionEngine`), with reasons and categories
+- progression generation (`ProgressionGenerator`, seeded beam search)
 
 It uses the `HarmonyEngine` types and measures. The core target stays free of style rules.
+See the README for the score terms.
 
 ### App layer
 
@@ -218,7 +220,7 @@ The tests cover:
 
 ## Non-Goals
 
-- genre presets and taste rules (see `HarmonySuggest`)
+- genre presets and taste rules in the core target (see `HarmonySuggest`)
 - chord recognition from arbitrary note lists
 - DAW transport sync
 - MIDI event timing

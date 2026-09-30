@@ -285,7 +285,7 @@ public extension VoiceLeading {
 ///   It does not use the score.
 ///
 /// Ties are broken by inversion index, then bass pitch, then top pitch.
-public struct VoiceLeadingEngine: VoiceLeading {
+public struct VoiceLeadingEngine: VoiceLeading, Sendable {
     /// The voicing settings.
     public var options: VoicingOptions
 

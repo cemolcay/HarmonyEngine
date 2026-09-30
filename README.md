@@ -4,6 +4,11 @@ A reusable Swift library for harmonic decision-making that sits above the [`Musi
 
 `HarmonyEngine` handles chord generation, voice leading, and MIDI note output. Sequencing, timing, and DAW integration belong to the app layer.
 
+The package has two libraries:
+
+- `HarmonyEngine` — style-free chord building, naming, measures, and voicing.
+- `HarmonySuggest` — style profiles, next-chord ranking, and progression generation, built on `HarmonyEngine`.
+
 ## Requirements
 
 - Swift 6.3+
@@ -34,10 +39,22 @@ HarmonyEngine/
     TransitionMetrics.swift   — measures of the move between two chords
     HarmonicPalette.swift     — diatonic chord catalog and role-based queries
     Errors.swift              — HarmonyEngineError
+  Sources/HarmonySuggest/
+    StyleProfile.swift        — StyleProfile, ChordFlavor, ChromaticDevice, AlterationTension
+    StyleProfiles.swift       — the 32 generated style profiles (do not edit by hand)
+    Suggestion.swift          — SuggestionRequest, SuggestionKnobs, PhrasePosition, Suggestion, SuggestionWeights
+    CandidateGenerator.swift  — candidate chords for a context and profile
+    SuggestionEngine.swift    — scoring and ranking
+    ProgressionGenerator.swift — seeded beam search, SplitMix64
+  Scripts/
+    convert_harmonicc_styles.py — generates StyleProfiles.swift from the Harmonicc style tables
   Tests/HarmonyEngineTests/
     HarmonyEngineTests.swift
     ChordSpecTests.swift
     VoicingTests.swift
+  Tests/HarmonySuggestTests/
+    HarmonySuggestTests.swift
+    SuggestionDumpTests.swift — prints rankings when HARMONY_SUGGEST_DUMP=1
 ```
 
 ## Core Types
@@ -244,6 +261,72 @@ let dominantChords = try HarmonicPalette.chords(for: .dominant, in: context)
 ```
 
 Role-to-degree mapping for heptatonic scales: tonic = 1, 3, 6 · predominant = 2, 4 · dominant = 5, 7 · color/passing = all degrees.
+
+## HarmonySuggest
+
+### Style profiles
+
+A `StyleProfile` is Codable data. It contains:
+
+| Field | Meaning |
+|---|---|
+| `transitions` | Weights of moves between Roman numeral degrees (1–7) |
+| `openingWeights` | Weights of degrees as the first chord |
+| `flavors` | Weights of chord flavors: triad, dominant 7th, 7th, 9th, 11th, 13th, sus2, sus4, 7sus4, 6, add9, 6/9, blues 7th |
+| `alterations` | ♭9, ♯9, ♯11, ♭13 on dominant chords (♯11 on major 7ths only when it is in the scale) |
+| `devices` | Chromatic devices and weights: V/x, vii°7/x, subV/x, ii/x, borrowed chords, N6, augmented sixths, CT°7, I64 |
+| `rootMotionWeights` | Weights of root motion by interval class |
+| `cadenceStrength` | How strongly phrases end on a cadence |
+| `voicing` | The default `VoicingOptions` of the style |
+
+`StyleProfile.all` has the 32 Harmonicc styles (`StyleProfile.jazz`, `StyleProfile.named("rAndB")`, …).
+They are generated from the Harmonicc tables:
+
+```sh
+python3 Scripts/convert_harmonicc_styles.py ../Harmonicc/Harmonicc/Harmonics > Sources/HarmonySuggest/StyleProfiles.swift
+```
+
+To tune a style, change the tables or the mappings in the script, and generate the file again.
+
+### Ranking the next chord
+
+```swift
+import HarmonySuggest
+
+let request = SuggestionRequest(
+    context: context,
+    profile: .jazz,
+    history: [.degree(2, tension: .diatonicSeventh)],        // the chords so far
+    position: PhrasePosition(step: 3, length: 4),            // optional: the phrase position
+    knobs: SuggestionKnobs(complexity: 0.5, chromaticism: 0.5, brightness: 0.5)
+)
+for suggestion in SuggestionEngine().suggestions(for: request) {
+    print(suggestion.name.roman, suggestion.name.symbol, suggestion.category, suggestion.reasons)
+    // V7 G7 diatonic [...]
+}
+```
+
+The score adds these terms (see `SuggestionEngine` and `SuggestionWeights`):
+
+- style transition and flavor weights (chromatic devices use their weight scaled by the chromaticism knob),
+- voice leading and common tones of the triad cores,
+- root motion,
+- resolution of the current chord (V/x → x, ii/x → V/x, N6 and augmented sixths → V, CT°7 → its chord, I64 → V),
+- cadence at the end of a phrase,
+- the complexity and brightness knobs (no effect at 0.5),
+- repetition and back-and-forth loops.
+
+Each `Suggestion` has a `category` (`.diatonic`, `.color`, `.chromatic`) and up to 3 `reasons`.
+The ranking is deterministic. At most `maxPerRoot` suggestions share a root.
+
+### Generating a progression
+
+```swift
+let specs = ProgressionGenerator().generate(length: 8, context: context, profile: .pop, seed: 42)
+```
+
+The generator does a beam search over the rankings, with a seeded random value for variety (`temperature`).
+The same seed gives the same progression. When `cadenceStrength` ≥ 0.5, the last chord is the tonic.
 
 ## Quick Example
 

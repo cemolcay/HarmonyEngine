@@ -34,7 +34,7 @@ public enum AvoidNotePolicy: Hashable, Codable, Sendable {
 /// 4. Final chord type — base type with tension intervals merged in.
 ///
 /// The builder also resolves a `ChordSpec` (see `buildChord(spec:context:)`).
-public struct ChordBuilder: ChordBuilding {
+public struct ChordBuilder: ChordBuilding, Sendable {
     /// What to do with avoid notes when `TensionPolicy.diatonicExtensions` stacks thirds.
     public var avoidNotes: AvoidNotePolicy
 

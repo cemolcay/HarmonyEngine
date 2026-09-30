@@ -15,6 +15,10 @@ let package = Package(
             name: "HarmonyEngine",
             targets: ["HarmonyEngine"],
         ),
+        .library(
+            name: "HarmonySuggest",
+            targets: ["HarmonySuggest"],
+        ),
     ],
     dependencies: [
         .package(url: "https://github.com/cemolcay/MusicTheory.git", from: "2.0.0")
@@ -26,9 +30,17 @@ let package = Package(
             name: "HarmonyEngine",
             dependencies: ["MusicTheory"]
         ),
+        .target(
+            name: "HarmonySuggest",
+            dependencies: ["HarmonyEngine", "MusicTheory"]
+        ),
         .testTarget(
             name: "HarmonyEngineTests",
             dependencies: ["HarmonyEngine"]
+        ),
+        .testTarget(
+            name: "HarmonySuggestTests",
+            dependencies: ["HarmonySuggest"]
         ),
     ],
     swiftLanguageModes: [.v6],

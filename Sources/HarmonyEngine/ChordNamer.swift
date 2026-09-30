@@ -17,7 +17,7 @@ public struct ChordName: Hashable, Sendable {
 ///   For scales that do not have 7 notes, the reference is the major scale on the scale root.
 /// - The suffix shows the quality: `°`, `ø7`, `°7`, `+`, `7`, `maj7`, extensions, and alterations.
 /// - Inversions use figured-bass numbers: `6`, `64` for triads, and `65`, `43`, `42` for seventh chords.
-public struct ChordNamer {
+public struct ChordNamer: Sendable {
     private let builder: ChordBuilder
     private static let numerals = ["I", "II", "III", "IV", "V", "VI", "VII"]
 

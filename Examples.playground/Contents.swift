@@ -202,7 +202,7 @@ print("\nDiatonic triads in D Dorian:")
 dorianTriads.forEach { print(" ", $0.root, $0.type.symbol) }
 
 // Custom 4-note scale — explicit chordType required
-let tetrachord = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, name: "Tetrachord")
+let tetrachord = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, description: "Tetrachord")
 let tetContext = HarmonyContext(tonic: .d, scale: tetrachord)
 
 let tetChord = try builder.buildChord(

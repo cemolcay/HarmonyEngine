@@ -5,11 +5,19 @@ import PackageDescription
 
 let package = Package(
     name: "HarmonyEngine",
+    platforms: [
+        .iOS(.v12),
+        .macOS(.v10_15),
+    ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
             name: "HarmonyEngine",
             targets: ["HarmonyEngine"],
+        ),
+        .library(
+            name: "HarmonySuggest",
+            targets: ["HarmonySuggest"],
         ),
     ],
     dependencies: [
@@ -22,9 +30,17 @@ let package = Package(
             name: "HarmonyEngine",
             dependencies: ["MusicTheory"]
         ),
+        .target(
+            name: "HarmonySuggest",
+            dependencies: ["HarmonyEngine", "MusicTheory"]
+        ),
         .testTarget(
             name: "HarmonyEngineTests",
             dependencies: ["HarmonyEngine"]
+        ),
+        .testTarget(
+            name: "HarmonySuggestTests",
+            dependencies: ["HarmonySuggest"]
         ),
     ],
     swiftLanguageModes: [.v6],

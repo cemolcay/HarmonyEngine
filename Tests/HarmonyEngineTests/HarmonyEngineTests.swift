@@ -27,7 +27,7 @@ final class HarmonyEngineTests: XCTestCase {
     }
 
     func testCustomScaleContextCanResolveChordRecipeDegree() throws {
-        let customScale = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, name: "Tetrachord")
+        let customScale = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, description: "Tetrachord")
         let context = HarmonyContext(tonic: .d, scale: customScale)
         let recipe = ChordRecipe(scaleDegree: 2, chordType: .minor)
 
@@ -61,7 +61,7 @@ final class HarmonyEngineTests: XCTestCase {
     }
 
     func testNonHeptatonicScaleRequiresExplicitChordType() throws {
-        let customScale = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, name: "Tetrachord")
+        let customScale = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, description: "Tetrachord")
         let context = HarmonyContext(tonic: .d, scale: customScale)
         let recipe = ChordRecipe(scaleDegree: 1) // nil chordType, non-7-note scale
 
@@ -275,7 +275,7 @@ final class HarmonyEngineTests: XCTestCase {
     }
 
     func testHarmonicPaletteNonHeptatonicScaleReturnsAllDegrees() throws {
-        let customScale = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, name: "Tetrachord")
+        let customScale = Scale(intervals: [.P1, .m2, .P4, .P5], root: .d, description: "Tetrachord")
         let context = HarmonyContext(tonic: .d, scale: customScale)
         // For non-7-note scales chords() returns all degrees regardless of role.
         // We must supply an explicit chordType via role-based recipes, but HarmonicPalette

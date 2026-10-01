@@ -15,4 +15,8 @@ public enum HarmonyEngineError: Error, Equatable, Sendable {
     case voicingOutOfRange
     /// The chord type could not be inferred or rebuilt from the given intervals.
     case unableToResolveChord
+    /// A `ChordSpec` with a chromatic (altered) degree has no `type`, and there is no default for it.
+    case missingChordType
+    /// The inversion index is not a chord tone index of the chord.
+    case invalidInversion(Int)
 }
